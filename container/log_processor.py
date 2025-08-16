@@ -27,6 +27,19 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+# Custom exception classes
+class NonRecoverableError(Exception):
+    """Exception for errors that should not be retried (e.g., missing tenant config)"""
+    pass
+
+class TenantNotFoundError(NonRecoverableError):
+    """Exception for when tenant configuration is not found"""
+    pass
+
+class InvalidS3NotificationError(NonRecoverableError):
+    """Exception for invalid S3 notifications that cannot be processed"""
+    pass
+
 # For Lambda, we need to ensure the root logger and all handlers are set to INFO
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
@@ -63,8 +76,13 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         try:
             process_sqs_record(record)
             successful_records += 1
+        except NonRecoverableError as e:
+            # Non-recoverable errors should not be retried
+            logger.warning(f"Non-recoverable error processing record {record.get('messageId', 'unknown')}: {str(e)}. Message will be removed from queue.")
+            successful_records += 1  # Count as successful to remove from queue
         except Exception as e:
-            logger.error(f"Failed to process record {record.get('messageId', 'unknown')}: {str(e)}", exc_info=True)
+            # Recoverable errors should be retried
+            logger.error(f"Recoverable error processing record {record.get('messageId', 'unknown')}: {str(e)}. Message will be retried.", exc_info=True)
             failed_records += 1
             
             # Add failed message ID to batch item failures
@@ -112,6 +130,7 @@ def sqs_polling_mode():
             logger.info(f"Received {len(messages)} messages from SQS")
             
             for message in messages:
+                should_delete_message = False
                 try:
                     # Convert SQS message to Lambda record format
                     lambda_record = {
@@ -121,17 +140,27 @@ def sqs_polling_mode():
                     }
                     
                     process_sqs_record(lambda_record)
+                    should_delete_message = True  # Successfully processed
                     
-                    # Delete processed message
-                    sqs_client.delete_message(
-                        QueueUrl=SQS_QUEUE_URL,
-                        ReceiptHandle=message['ReceiptHandle']
-                    )
-                    logger.info(f"Successfully processed and deleted message {message['MessageId']}")
+                except NonRecoverableError as e:
+                    logger.warning(f"Non-recoverable error processing message {message.get('MessageId', 'unknown')}: {str(e)}. Message will be deleted to prevent infinite retries.")
+                    should_delete_message = True  # Delete to prevent infinite retries
                     
                 except Exception as e:
-                    logger.error(f"Failed to process message {message.get('MessageId', 'unknown')}: {str(e)}")
-                    # Message will become visible again after visibility timeout
+                    logger.error(f"Recoverable error processing message {message.get('MessageId', 'unknown')}: {str(e)}. Message will be retried.")
+                    should_delete_message = False  # Don't delete - allow retry
+                
+                # Delete message if processing succeeded or if error is non-recoverable
+                if should_delete_message:
+                    try:
+                        sqs_client.delete_message(
+                            QueueUrl=SQS_QUEUE_URL,
+                            ReceiptHandle=message['ReceiptHandle']
+                        )
+                        logger.info(f"Successfully deleted message {message['MessageId']}")
+                    except Exception as delete_error:
+                        logger.error(f"Failed to delete message {message['MessageId']}: {str(delete_error)}")
+                        # Continue processing other messages even if delete fails
                     
         except KeyboardInterrupt:
             logger.info("Received interrupt signal, shutting down...")
@@ -174,36 +203,59 @@ def process_sqs_record(sqs_record: Dict[str, Any]) -> None:
     """
     try:
         # Parse the SQS message body (SNS message)
-        sns_message = json.loads(sqs_record['body'])
-        s3_event = json.loads(sns_message['Message'])
+        try:
+            sns_message = json.loads(sqs_record['body'])
+            s3_event = json.loads(sns_message['Message'])
+        except (json.JSONDecodeError, KeyError) as e:
+            raise InvalidS3NotificationError(f"Invalid SQS message format: {str(e)}")
         
         # Extract S3 event details
         for s3_record in s3_event['Records']:
-            bucket_name = s3_record['s3']['bucket']['name']
-            object_key = urllib.parse.unquote_plus(s3_record['s3']['object']['key'])
+            try:
+                bucket_name = s3_record['s3']['bucket']['name']
+                object_key = urllib.parse.unquote_plus(s3_record['s3']['object']['key'])
+            except KeyError as e:
+                raise InvalidS3NotificationError(f"Invalid S3 event format: missing {str(e)}")
             
             logger.info(f"Processing S3 object: s3://{bucket_name}/{object_key}")
             
-            # Extract tenant information from object key
-            tenant_info = extract_tenant_info_from_key(object_key)
+            try:
+                # Extract tenant information from object key
+                tenant_info = extract_tenant_info_from_key(object_key)
+                
+                # Get tenant configuration
+                tenant_config = get_tenant_configuration(tenant_info['tenant_id'])
+                
+                # Check if this application should be processed based on desired_logs filtering
+                if not should_process_application(tenant_config, tenant_info['application']):
+                    logger.info(f"Skipping processing for application '{tenant_info['application']}' due to desired_logs filtering")
+                    continue
+                
+                # Download and process the log file
+                log_events, s3_timestamp = download_and_process_log_file(bucket_name, object_key)
+                
+                # Deliver logs to customer account
+                deliver_logs_to_customer(log_events, tenant_config, tenant_info, s3_timestamp)
+                
+            except TenantNotFoundError as e:
+                logger.warning(f"Tenant not found for S3 object {object_key}: {str(e)}. Message will be removed from queue.")
+                # Don't re-raise - this is a non-recoverable error
+            except InvalidS3NotificationError as e:
+                logger.warning(f"Invalid S3 notification for object {object_key}: {str(e)}. Message will be removed from queue.")
+                # Don't re-raise - this is a non-recoverable error
+            except NonRecoverableError as e:
+                logger.warning(f"Non-recoverable error processing S3 object {object_key}: {str(e)}. Message will be removed from queue.")
+                # Don't re-raise - this is a non-recoverable error
+            except Exception as e:
+                logger.error(f"Recoverable error processing S3 object {object_key}: {str(e)}. Message will be retried.")
+                raise  # Re-raise recoverable errors for retry
             
-            # Get tenant configuration
-            tenant_config = get_tenant_configuration(tenant_info['tenant_id'])
-            
-            # Check if this application should be processed based on desired_logs filtering
-            if not should_process_application(tenant_config, tenant_info['application']):
-                logger.info(f"Skipping processing for application '{tenant_info['application']}' due to desired_logs filtering")
-                continue
-            
-            # Download and process the log file
-            log_events, s3_timestamp = download_and_process_log_file(bucket_name, object_key)
-            
-            # Deliver logs to customer account
-            deliver_logs_to_customer(log_events, tenant_config, tenant_info, s3_timestamp)
-            
+    except NonRecoverableError as e:
+        logger.warning(f"Non-recoverable error processing SQS record: {str(e)}. Message will be removed from queue.")
+        # Don't re-raise - this is a non-recoverable error
     except Exception as e:
-        logger.error(f"Error processing SQS record: {str(e)}")
-        raise
+        logger.error(f"Recoverable error processing SQS record: {str(e)}. Message will be retried.")
+        raise  # Re-raise recoverable errors for retry
 
 def extract_tenant_info_from_key(object_key: str) -> Dict[str, str]:
     """
@@ -213,7 +265,7 @@ def extract_tenant_info_from_key(object_key: str) -> Dict[str, str]:
     path_parts = object_key.split('/')
     
     if len(path_parts) < 5:
-        raise ValueError(f"Invalid object key format. Expected at least 5 path segments, got {len(path_parts)}: {object_key}")
+        raise InvalidS3NotificationError(f"Invalid object key format. Expected at least 5 path segments, got {len(path_parts)}: {object_key}")
 
     tenant_info = {
         'cluster_id': path_parts[0],
@@ -244,7 +296,7 @@ def get_tenant_configuration(tenant_id: str) -> Dict[str, Any]:
         response = table.get_item(Key={'tenant_id': tenant_id})
         
         if 'Item' not in response:
-            raise ValueError(f"No configuration found for tenant: {tenant_id}")
+            raise TenantNotFoundError(f"No configuration found for tenant: {tenant_id}")
         
         config = response['Item']
         
@@ -411,10 +463,6 @@ def convert_log_record_to_event(log_record: Dict[str, Any]) -> Optional[Dict[str
     Convert log record to CloudWatch Logs event format
     """
     try:
-        if not isinstance(log_record, dict):
-            logger.warning(f"Log record is not a dict: {type(log_record)}")
-            return None
-            
         # Handle timestamp - Vector might use different field names
         timestamp = log_record.get('timestamp') or log_record.get('.timestamp') or log_record.get('time')
         if timestamp:
@@ -552,7 +600,7 @@ def deliver_logs_with_vector(
         temp_config_fd, temp_config_path = tempfile.mkstemp(suffix='.yaml', prefix='vector-config-')
         with os.fdopen(temp_config_fd, 'w') as f:
             f.write(config)
-        temp_config_fd = None  # File is closed by fdopen
+        # File descriptor is automatically closed by fdopen
         
         # Create data directory for Vector
         data_dir = f"/tmp/vector-{session_id}"
