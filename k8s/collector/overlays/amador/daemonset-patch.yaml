@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vector-logs
+spec:
+  template:
+    spec:
+      containers:
+      - name: vector
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "50m"
+          limits:
+            memory: "2Gi"
+            cpu: "200m"
+        env:
+        - name: VECTOR_LOG
+          value: "DEBUG"
+        - name: AWS_REGION
+          value: "us-east-1"
+        - name: AWS_DEFAULT_REGION
+          value: "us-east-1"
+        - name: S3_BUCKET_NAME
+          value: "cp-logs-test"
+        - name: S3_WRITER_ROLE_ARN
+          value: "arn:aws:iam::692859910892:role/ManagedOpenShift-Observability"
+        - name: CLUSTER_ID
+          value: "scuppett-oepz"
