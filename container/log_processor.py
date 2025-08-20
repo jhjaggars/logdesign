@@ -291,6 +291,20 @@ def extract_tenant_info_from_key(object_key: str) -> Dict[str, str]:
     logger.info(f"Extracted tenant info: {tenant_info}")
     return tenant_info
 
+def validate_tenant_config(config: Dict[str, Any], tenant_id: str) -> None:
+    """
+    Validate that tenant configuration contains all required fields
+    """
+    required_fields = ['log_distribution_role_arn', 'log_group_name', 'target_region']
+    
+    for field in required_fields:
+        if field not in config:
+            raise TenantNotFoundError(f"Tenant {tenant_id} is missing required field: {field}")
+        
+        value = config[field]
+        if not value or (isinstance(value, str) and not value.strip()):
+            raise TenantNotFoundError(f"Tenant {tenant_id} has empty or invalid value for required field: {field}")
+
 def get_tenant_configuration(tenant_id: str) -> Dict[str, Any]:
     """
     Retrieve tenant configuration from DynamoDB
@@ -305,6 +319,9 @@ def get_tenant_configuration(tenant_id: str) -> Dict[str, Any]:
         
         config = response['Item']
         
+        # Validate required fields
+        validate_tenant_config(config, tenant_id)
+        
         # Log tenant configuration details including desired_logs and enabled status
         desired_logs = config.get('desired_logs')
         enabled = config.get('enabled', True)  # Default to True if not present for backward compatibility
@@ -316,6 +333,9 @@ def get_tenant_configuration(tenant_id: str) -> Dict[str, Any]:
         
         return config
         
+    except TenantNotFoundError:
+        # Re-raise TenantNotFoundError as-is
+        raise
     except Exception as e:
         logger.error(f"Failed to get tenant configuration for {tenant_id}: {str(e)}")
         raise

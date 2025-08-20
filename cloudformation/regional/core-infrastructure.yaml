@@ -201,6 +201,8 @@ Resources:
           AttributeType: S
         - AttributeName: status
           AttributeType: S
+        - AttributeName: target_region
+          AttributeType: S
       KeySchema:
         - AttributeName: tenant_id
           KeyType: HASH
@@ -214,6 +216,12 @@ Resources:
         - IndexName: StatusIndex
           KeySchema:
             - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: TargetRegionIndex
+          KeySchema:
+            - AttributeName: target_region
               KeyType: HASH
           Projection:
             ProjectionType: ALL
