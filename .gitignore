@@ -64,10 +64,7 @@ venv.bak/
 *.bak
 *.backup
 
-# Test files
-test_*.py
-*_test.py
-tests/
+# Test files - removed to allow committing unit tests
 
 # Coverage reports
 htmlcov/

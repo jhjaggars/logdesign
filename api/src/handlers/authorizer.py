@@ -7,9 +7,8 @@ import logging
 import os
 from typing import Dict, Any
 
-# Import our authentication utilities directly  
-# Since the utils directory is copied to the root of the container
-from utils.auth import authenticate_request, AuthenticationError
+# Import our authentication utilities
+from src.utils.auth import authenticate_request, AuthenticationError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
